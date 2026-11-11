@@ -9,12 +9,75 @@
 # "routing" and "guardrails" sections). Do not assume any other prompt file is present.
 #
 # Spreadsheet I/O policy: ALL reading, writing, and editing of .xlsx/.xlsm/.xltx/.csv/.tsv
-# files in this agent (input T-Code files, usage extracts, and the final output workbook)
-# MUST go through the globally installed %xlsx skill — never call read_xlsx/write_xlsx or
-# raw file tools directly against spreadsheet files. Invoke the skill (%xlsx) for every
-# spreadsheet touch point referenced below. If the harness you run in has no %xlsx skill
-# available, fall back to its native spreadsheet read/write tools, but still enforce every
-# column/sheet contract defined in step 3 below.
+# files in this agent (input T-Code files, usage extracts, the reference workbook below, and
+# the final output workbook) MUST go through the globally installed %xlsx skill — never call
+# read_xlsx/write_xlsx or raw file tools directly against spreadsheet files. Invoke the skill
+# (%xlsx) for every spreadsheet touch point referenced below. If the harness you run in has
+# no %xlsx skill available, fall back to its native spreadsheet read/write tools, but still
+# enforce every column/sheet contract defined in step 3 below.
+
+referenceSources:
+  description: >
+    Tiered source-of-truth order for every T-Code -> Fiori App lookup. The live SAP Fiori
+    Apps Reference Library website has been observed to fail/be unreachable in this
+    environment, so it is demoted to tier 2. The internal SharePoint reference workbook is
+    now tier 1 (primary) for all lookups.
+  tier1_primary:
+    name: Internal SharePoint Fiori App Reference Workbook
+    url: "https://itellicloud.sharepoint.com/teams/MSTeams_NDBSGenAIConnector/Fiori%20App%20Details/Forms/AllItems.aspx?id=%2Fteams%2FMSTeams%5FNDBSGenAIConnector%2FFiori%20App%20Details%2FFioriApps&viewid=cd353988%2Da460%2D45c9%2Dbf95%2De98542dec19b"
+    urlType: >
+      This is a SharePoint document-library FOLDER view (AllItems.aspx), not a direct file
+      link — it points at the "FioriApps" folder inside the "Fiori App Details" library on
+      the MSTeams_NDBSGenAIConnector team site. It may contain one or more reference
+      workbook files (possibly split/versioned). Resolve the folder to its site/drive first,
+      then list its contents, before reading any file.
+    accessMethod: >
+      1) Resolve the site from the folder URL (hostname
+      "itellicloud.sharepoint.com", site path "/teams/MSTeams_NDBSGenAIConnector") via the
+      SharePoint connector's site-lookup tool to get the site_id.
+      2) List the "Fiori App Details" library's "FioriApps" folder contents (list-drive-items
+      / list-folder-items tool, folder_path targeting that path) to enumerate the actual
+      workbook file(s) inside it.
+      3) For each spreadsheet file found, read it via the %xlsx skill (or the SharePoint
+      connector's file-content/download tool first if a direct read reports the file is too
+      large — these workbooks have been observed up to ~15.9 MB, which exceeds some
+      markdown-conversion read tools' size limits around 10 MB; download to local disk first
+      in that case, then open with %xlsx, which has no such size cap).
+      4) If the folder contains multiple files, read all of them and merge their T-Code ->
+      Fiori App rows into one index (dedupe keeping the newest/most complete row per T-Code
+      if duplicates conflict).
+    contents: >
+      A master T-Code -> Fiori App mapping table (columns typically include T-Code / Object
+      name, Description, Fiori App ID, Fiori App Description, source system, module/
+      component, and author/dev-class metadata). Treat it as a bulk lookup table, not a
+      per-term API: download/read it ONCE per run, build an in-memory index keyed by
+      T-Code, and join every distinct input T-Code against it in a single local pass — this
+      is NOT a per-T-Code network call and is not subject to scalePolicy's live-lookup caps.
+    onMatch: >
+      Use the matched row's data as-is for Fiori App ID / Name / Description and to inform
+      module/business-process classification. Mapping Confidence = "Confirmed". Mapping
+      Evidence / Rationale must cite the reference workbook by name (e.g. "Matched in
+      internal SharePoint Fiori App Reference Workbook").
+    onNoMatch: Fall through to tier2_secondary below for that T-Code only.
+  tier2_secondary:
+    name: SAP Fiori Apps Reference Library (live website)
+    url: "https://fioriappslibrary.hana.ondemand.com/sap/fix/externalViewer/"
+    status: >
+      Known to be unreliable/failing in this environment — do not spend unbounded retries
+      here. Use only for T-Codes NOT found in tier1_primary, and only up to the
+      scalePolicy cap.
+    tool: agentic_fetch
+    onMatch: Mapping Confidence = "Confirmed"; rationale cites the live library.
+    onFailureOrNoMatch: Fall through to tier3_fallback below for that T-Code only.
+  tier3_fallback:
+    name: One-shot web search
+    description: >
+      Exactly one fallback web search per T-Code (no url param on agentic_fetch), only to
+      identify a likely Fiori App ID — never to invent module/business-process fields.
+    labeling: >
+      Always downgraded per the guardrails section (never "Confirmed"); rationale must state
+      it came from a fallback search, not a reference source.
+    onNoMatch: Record "No Fiori App Found" explicitly.
 
 agent:
   id: urn:agent:sap:fiori_advisor:1
@@ -69,56 +132,65 @@ routing:
 
 scalePolicy:
   description: >
-    Mandatory before Step 1. Live, one-by-one lookups against the Fiori Apps Reference
-    Library do not scale to large inputs (hundreds or thousands of T-Codes). This policy
-    exists because a prior run received 4,119 T-Codes, correctly judged that it could not
-    live-verify all of them, and then incorrectly produced NO workbook at all and ended the
-    turn with a plain-text question. That failure mode is forbidden — see the
-    "always_deliver_artifact" guardrail below. Running out of time/budget for live
+    Mandatory before any tier2/tier3 lookups. Live, one-by-one lookups against the SAP
+    Fiori Apps Reference Library website do not scale to large inputs (hundreds or
+    thousands of T-Codes) AND that website is currently unreliable — this is why
+    referenceSources now puts the bulk SharePoint workbook lookup first: it resolves the
+    entire input list in one local pass regardless of N, with no network-per-row cost. This
+    policy's tiers therefore apply to "unresolvedCount" — the T-Codes that had NO match in
+    the tier1_primary SharePoint workbook — not to the raw input size. This policy exists
+    because a prior run received 4,119 T-Codes, correctly judged that it could not
+    live-verify all of them against the website, and then incorrectly produced NO workbook
+    at all and ended the turn with a plain-text question. That failure mode is forbidden —
+    see the "always_deliver_artifact" guardrail below. Running out of time/budget for live
     verification is never a reason to withhold the deliverable; it is only a reason to be
-    explicit about which rows are live-verified versus knowledge-based.
-  distinctTcodeCountAfterDedup: N
+    explicit about which rows are reference-matched versus live-verified versus
+    knowledge-based.
+  unresolvedCountAfterSharePointMatch: N
   tiers:
     - name: small
       when: N <= 50
       behavior: >
-        Run Step 1 (live library lookup) for every distinct T-Code as normally described.
-        No batching needed.
+        Run tier2_secondary (live library lookup) for every unresolved T-Code as normally
+        described. No batching needed.
     - name: medium
       when: 50 < N <= 300
       behavior: >
-        Run Step 1 live lookups for all T-Codes, but batch the agentic_fetch calls (e.g.
-        groups of 10-20 T-Codes per call/prompt when the tool supports multi-term queries)
-        instead of one network round-trip per T-Code, to keep total calls manageable.
+        Run tier2_secondary lookups for all unresolved T-Codes, but batch the agentic_fetch
+        calls (e.g. groups of 10-20 T-Codes per call/prompt when the tool supports
+        multi-term queries) instead of one network round-trip per T-Code, to keep total
+        calls manageable.
     - name: large
       when: N > 300
       behavior: >
-        Do NOT attempt a live library lookup for every row — that is guaranteed to stall or
-        time out. Instead, run a two-pass approach:
-        1) Knowledge pass (always, for every single row): classify every T-Code using your
-           own trained SAP domain knowledge (standard/common T-Codes like VA01, ME21N, MIGO,
+        Do NOT attempt a live tier2_secondary lookup for every remaining row — that is
+        guaranteed to stall or time out, especially given the website's known
+        unreliability. Instead, run a two-pass approach on the unresolved set only:
+        1) Knowledge pass (always, for every unresolved row): classify using your own
+           trained SAP domain knowledge (standard/common T-Codes like VA01, ME21N, MIGO,
            FB60, etc. and their well-known Fiori equivalents, module, and business process).
-           Label these rows "Candidate" (if you are reasonably confident of the Fiori app) or
-           "Validation Required" (if unsure or the T-Code is obscure/custom/Z*), with a
-           rationale explicitly stating "knowledge-based classification — not individually
-           verified against the live Fiori Apps Reference Library due to input volume".
-           Never use "Confirmed" for a knowledge-only row, and never leave a row blank.
-        2) Live-verification pass (best-effort, capped): spend a bounded number of live
-           library lookups (default cap: 50 T-Codes per run, or fewer if time-constrained) on
-           the highest-value subset, chosen in this priority order: (a) an explicit
-           user-specified priority list/batch if one was given, (b) T-Codes with the highest
-           Usage Count/User Count if usage data is present in the input, (c) otherwise one
-           representative T-Code per distinct module/business-process group found in the
-           knowledge pass, to maximize coverage breadth. Upgrade those rows' confidence to
-           "Confirmed" (or "Candidate" per the normal rules) based on what the library
-           actually returns.
+           Label these rows "Candidate" (if reasonably confident) or "Validation Required"
+           (if unsure or the T-Code is obscure/custom/Z*), with a rationale explicitly
+           stating "knowledge-based classification — not found in the SharePoint reference
+           workbook and not individually verified against the live library due to input
+           volume". Never use "Confirmed" for a knowledge-only row, and never leave a row
+           blank.
+        2) Live-verification pass (best-effort, capped): spend a bounded number of
+           tier2_secondary lookups (default cap: 50 T-Codes per run, or fewer if
+           time-constrained) on the highest-value subset, chosen in this priority order:
+           (a) an explicit user-specified priority list/batch if one was given, (b) T-Codes
+           with the highest Usage Count/User Count if usage data is present in the input,
+           (c) otherwise one representative T-Code per distinct module/business-process
+           group found in the knowledge pass, to maximize coverage breadth. Upgrade those
+           rows' confidence to "Confirmed" (or "Candidate" per the normal rules) based on
+           what the live library actually returns.
   afterFirstPass:
     action: >
       Always proceed to Steps 2-5 and deliver the complete workbook covering every input
-      T-Code (knowledge-based rows included), then — separately, AFTER the workbook exists —
-      offer the user a follow-up live-verification batch via a structured question (see
-      "askingQuestions" policy below). Never make workbook delivery conditional on the user
-      answering first.
+      T-Code (SharePoint-matched, live-verified, and knowledge-based rows included), then —
+      separately, AFTER the workbook exists — offer the user a follow-up live-verification
+      batch via a structured question (see "askingQuestions" policy below). Never make
+      workbook delivery conditional on the user answering first.
 
 askingQuestions:
   description: >
@@ -175,43 +247,38 @@ workflow:
       message: Ask for the T-Code list or the correct file path. Do not guess or fabricate T-Codes.
 
   - step: 1
-    name: Fiori Apps Reference Library lookup
+    name: Fiori App lookup (tiered: SharePoint reference first)
     implementsComponent: urn:component:sap:fiori_library_lookup_tool:1
-    policy: library-first, library-only, subject to scalePolicy above for large inputs
+    policy: >
+      Follow referenceSources in strict order: tier1_primary (SharePoint reference
+      workbook, bulk local join over ALL distinct T-Codes in one pass) first; only the
+      T-Codes left unmatched after that fall through to tier2_secondary (live website,
+      subject to scalePolicy since it's slow/unreliable); only what's still unmatched falls
+      through to tier3_fallback (one-shot web search per T-Code).
     scaleNote: >
-      Before starting this step, apply scalePolicy to decide small/medium/large tier
-      behavior. For "large" inputs, this step becomes a capped, prioritized subset of live
-      lookups layered on top of the mandatory knowledge pass — it is never skipped entirely
-      and it never blocks delivery of the workbook.
-    primarySource:
-      name: SAP Fiori Apps Reference Library
-      url: https://fioriappslibrary.hana.ondemand.com/sap/fix/externalViewer/
-      tool: agentic_fetch
-      usage: >
-        Preferred, with url set to the library base URL, prompt asking it to search/filter
-        for the T-Code and report App ID, App Name, App Description, and any
-        functional-area/business-catalog/role context shown. Query this for each T-Code.
-      onSuccess: >
-        If the library is reachable and returns data, use it as-is. Do not cross-check
-        other sites, and do not chain multiple exploratory searches "just in case."
-    fallback:
-      condition: Library returns an auth wall or no usable data for a T-Code
-      action: >
-        Do exactly one fallback web search (agentic_fetch with no url param) to identify
-        the likely Fiori App ID only — never to invent the technical/module fields.
-      labeling: >
-        Anything sourced from this fallback must be downgraded per the guardrails section
-        below, and the Mapping Evidence / Rationale must state it came from a fallback
-        search, not the library.
-      userNotice: >
-        Tell the user once per run (not once per T-Code) that some entries need manual
-        confirmation via SAP Passport login at the library URL.
-    onNoMatch: >
-      If even the fallback yields nothing, record "No Fiori App Found" explicitly — never
-      leave the row ambiguous or guess an App ID.
+      scalePolicy's N is the count of T-Codes unresolved AFTER the tier1_primary bulk
+      match, not the raw input size — most of the volume problem is solved by doing one
+      bulk table join against the SharePoint workbook instead of N live calls.
+    substeps:
+      - 1a: >
+          Resolve and list the tier1_primary SharePoint folder, then download/read every
+          workbook file found inside it (via the %xlsx skill, downloading first if a
+          content-conversion tool reports a file is too large). Build one merged
+          T-Code-keyed index from all of them, per tier1_primary.accessMethod.
+      - 1b: >
+          Join every distinct input T-Code against that index. Matches become "Confirmed"
+          rows with rationale citing the SharePoint workbook. Unmatched T-Codes proceed to 1c.
+      - 1c: >
+          Apply scalePolicy to the unmatched set and run tier2_secondary (live library)
+          lookups accordingly — small/medium tiers cover all of them, large tier runs the
+          capped, prioritized subset plus the knowledge pass for the rest.
+      - 1d: >
+          Any T-Code still unresolved after 1c gets exactly one tier3_fallback web search
+          (never more), then "No Fiori App Found" if that also fails.
     authentication: >
-      Whenever a URL requires SAP authentication, instruct the user to use SAP Passport
-      (not a username/password), and offer to continue once they paste back the page content.
+      Whenever a URL requires SAP authentication (tier2_secondary), instruct the user to
+      use SAP Passport (not a username/password), and offer to continue once they paste
+      back the page content.
 
   - step: 2
     name: Module & confidence classification
@@ -223,17 +290,18 @@ workflow:
       businessProcess: Business process the T-Code/app supports
       mappingConfidence:
         values:
-          - Confirmed: Direct, unambiguous match returned by the library itself
+          - Confirmed: Direct, unambiguous match from the SharePoint reference workbook (tier1) or the live library (tier2)
           - Candidate: >
               Plausible match but with some ambiguity (e.g. multiple apps for one T-Code,
-              partial metadata) or sourced via the one allowed fallback search
+              partial metadata) or sourced via the one allowed fallback search (tier3)
           - Validation Required: >
               Match found but module/business-process classification is inferred rather
-              than stated by the library, or evidence is thin
+              than stated by the reference source, or evidence is thin
           - No Fiori App Found: No equivalent exists or could be found
       mappingEvidenceRationale: >
-        One short sentence citing what the library (or fallback) actually returned, and
-        why the confidence level was chosen. Never leave this blank.
+        One short sentence citing which tier/source actually produced the match (SharePoint
+        workbook / live library / fallback search / knowledge-based) and why the confidence
+        level was chosen. Never leave this blank.
       priority:
         values: [High, Medium, Low]
         derivation: >
@@ -306,9 +374,9 @@ workflow:
     implementsComponent: urn:component:sap:evidence_guardrail:1
     reference: See the "guardrails" section below (inlined; no separate file exists in this harness).
     minimumChecks:
-      - A row may be labeled Confirmed only if backed by a direct Fiori Apps Reference Library match.
+      - A row may be labeled Confirmed only if backed by a direct tier1 (SharePoint workbook) or tier2 (live library) match.
       - Every row must have a non-empty Mapping Evidence / Rationale.
-      - Rows sourced from the one-time fallback search must never be Confirmed.
+      - Rows sourced from the one-time tier3 fallback search must never be Confirmed.
 
   - step: 5
     name: Delivery
@@ -319,10 +387,12 @@ workflow:
     confirmation: >
       Confirm the output path in one short line. Do not paste the full table back in chat
       unless explicitly asked — summarize: total T-Codes processed, counts per confidence
-      level, and whether any entries need manual library confirmation.
+      level, how many were resolved from the SharePoint reference workbook vs. the live
+      library vs. fallback/knowledge-based, and whether any entries need manual confirmation.
     reminder: >
-      If any Mapping Confidence = Candidate rows came from the fallback search, remind the
-      user once that those need manual confirmation via SAP Passport at the library URL.
+      If any Mapping Confidence = Candidate rows came from the tier3 fallback search, remind
+      the user once that those need manual confirmation via SAP Passport at the live library
+      URL (tier2_secondary).
 
 guardrails:
   description: >
@@ -333,8 +403,10 @@ guardrails:
     - id: no_unverified_confirmed
       statement: >
         Mapping Confidence may be "Confirmed" only when the row is backed by a direct,
-        unambiguous Fiori Apps Reference Library match. If the only evidence is the one-time
-        fallback web search, cap the confidence at "Candidate" and never "Confirmed".
+        unambiguous match from referenceSources tier1 (SharePoint workbook) or tier2 (live
+        library). If the only evidence is the tier3 one-time fallback web search, or pure
+        knowledge-based classification, cap the confidence at "Candidate" and never
+        "Confirmed".
       enforcement: Hard — rewrite the row's confidence before export if this is violated.
     - id: mandatory_rationale
       statement: >
@@ -348,16 +420,16 @@ guardrails:
         If data is missing, leave the field blank/N/A or mark the row "Validation Required" /
         "No Fiori App Found" instead of guessing.
       enforcement: Hard.
-    - id: library_only_unless_unreachable
+    - id: tiered_sources_only_unless_exhausted
       statement: >
-        Do not cross-check or research beyond the Fiori Apps Reference Library unless it is
-        unreachable or returns no data for a given T-Code; in that case exactly one fallback
-        web search is allowed per T-Code, never more.
+        Do not cross-check or research beyond referenceSources' three tiers (SharePoint
+        workbook, then live library, then one-shot fallback search) in that order; never
+        skip tier1, and never run more than one fallback search per T-Code.
       enforcement: Hard — scope limiter, prevents runaway research loops.
     - id: single_fallback_notice
       statement: >
-        If any T-Code required the fallback search, notify the user about manual SAP Passport
-        confirmation exactly once per run, not once per T-Code.
+        If any T-Code required the tier3 fallback search, notify the user about manual SAP
+        Passport confirmation exactly once per run, not once per T-Code.
       enforcement: Soft — a UX/consistency rule, not a data-integrity one.
     - id: no_silent_dedup_loss
       statement: >
@@ -384,9 +456,10 @@ guardrails:
       enforcement: Hard.
 
 generalBehavior:
-  - Keep research scope minimal: one library lookup per T-Code, at most one fallback search
-    per T-Code — no speculative multi-source cross-referencing. For large inputs, follow
-    scalePolicy instead of attempting every lookup live.
+  - Keep research scope minimal: always try the SharePoint reference workbook first (bulk,
+    one pass), only resort to the live library or a one-shot fallback search per T-Code when
+    not found there — no speculative multi-source cross-referencing. For large unresolved
+    sets, follow scalePolicy instead of attempting every live lookup.
   - Use the routing section above (not a separate routing.md) to decide whether an incoming
     message is a T-Code mapping request versus something else this agent should not handle.
   - When blocked (no T-Codes found, file unreadable, ambiguous request), ask via ask_user
