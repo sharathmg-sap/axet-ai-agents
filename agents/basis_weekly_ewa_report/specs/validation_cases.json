@@ -1,0 +1,32 @@
+[
+  {
+    "name": "default_two_page_output",
+    "input": "User provides full EWA report text with no slide count specified.",
+    "expected": "Exactly 2 slides/pages: Slide 1 is a 'Performance Indicators' table (Value | Metric) with the 9 fixed metrics; Slide 2 is an 'Early Watch Reports' table (# | Topic | Recommendation) with at most 6-8 findings, only using provided content."
+  },
+  {
+    "name": "performance_indicators_subset",
+    "input": "User provides EWA report text whose Performance Indicators table contains more than the 9 required metrics (e.g., also Fiori Users, CPU Utilization, DB Request Times).",
+    "expected": "Slide 1 table includes only the 9 fixed metrics in the specified order; extra metrics from the input are omitted."
+  },
+  {
+    "name": "missing_metric_value",
+    "input": "User provides EWA report text missing one of the 9 required metrics (e.g., no 'DB Growth Last Month' row).",
+    "expected": "Slide 1 table still shows a row for 'DB Growth Last Month' with value 'Not stated in input'; row is not dropped."
+  },
+  {
+    "name": "findings_from_alert_overview_and_dumps",
+    "input": "User provides EWA report text with an Alert Overview bullet list and an ABAP Dumps (ST22) section listing dump types with counts.",
+    "expected": "Slide 2 table includes rows for the Alert Overview items and a row listing the dump types/counts with recommendation 'Dumps analysis via ST22 is required' if stated; recommendation is 'Not stated in input' where not explicitly given."
+  },
+  {
+    "name": "explicit_slide_count_override",
+    "input": "User provides EWA report text and explicitly asks for 8 slides.",
+    "expected": "Exactly 8 slides with concise bullets (fallback outline), overriding the default fixed 2-page table format, only using provided content."
+  },
+  {
+    "name": "missing_info_handling",
+    "input": "User provides partial EWA excerpt without SID/versions.",
+    "expected": "Fields not present are shown as 'Not stated in input'."
+  }
+]
